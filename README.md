@@ -26,7 +26,7 @@ session would sit idle once the summary is written. After every
 user message to make pi resume the in-flight task. The exact wording depends
 on which check fired (pre-turn, mid-turn, emergency, or session-resume).
 
-The follow-up is suppressed in two cases:
+The follow-up is suppressed when:
 
 - The user ran `/compact` manually — the callback path used here only fires
   for compactions this extension started, so manual compaction is never
@@ -34,6 +34,9 @@ The follow-up is suppressed in two cases:
 - The agent is no longer idle when the summary finishes, e.g. the user
   already typed something or another extension started a turn while
   summarising. Their input acts as the kickoff and we stay quiet.
+- The extension runtime has shut down or Pi is running in print/JSON mode.
+  One-shot modes exit after their original prompt, so they must not enqueue a
+  continuation against a runtime that is about to be disposed.
 
 ### Compaction Strategies
 
@@ -95,7 +98,7 @@ pi -e ./extensions/auto-compact.ts
 | Check timing | After `agent_end` only | Before requests + after tools |
 | Overflow protection | None | Emergency truncation |
 | Mid-turn handling | None | Checks after each tool batch |
-| Auto-continue | No | Yes — sends an English follow-up nudge after auto-compaction |
+| Auto-continue | No | Yes in interactive mode; suppressed in print/JSON mode |
 
 ## License
 

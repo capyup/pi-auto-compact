@@ -24,6 +24,7 @@ import type { ExtensionAPI, ExtensionContext, AgentMessage } from "@earendil-wor
 import { estimateTokens, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+import assert from "node:assert/strict";
 
 // =========================================================================
 // Compaction strategy types
@@ -104,6 +105,25 @@ async function loadSettings(): Promise<Partial<AutoCompactConfig>> {
 async function saveSettings(config: AutoCompactConfig): Promise<void> {
   await mkdir(path.dirname(SETTINGS_PATH), { recursive: true });
   await writeFile(SETTINGS_PATH, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+}
+
+/**
+ * Decide which token count to act on given pi's context-usage snapshot.
+ *
+ * `getContextUsage()` returns `tokens: null` right after a compaction, until
+ * an assistant has responded past the compaction boundary — pi itself treats
+ * that as "unknown, don't compact yet" (see agent-session.js). Falling back
+ * to a stale `lastEstimatedTokens` here would reintroduce the exact bug this
+ * guards against: the pre-compaction estimate re-triggering compaction on
+ * the very next (near-empty) turn, aborting it, and failing with
+ * "Nothing to compact (session too small)".
+ */
+function resolveTokenUsage(
+  usage: { tokens: number | null } | undefined,
+  lastEstimatedTokens: number,
+): number {
+  if (usage) return usage.tokens ?? 0;
+  return lastEstimatedTokens;
 }
 
 /**
@@ -253,6 +273,16 @@ function createTruncationNotice(removedCount: number, removedTokens: number): Ag
   };
 }
 
+function deferWhileActive(
+  isActive: () => boolean,
+  action: () => void,
+  defer: (callback: () => void) => unknown = setImmediate,
+): void {
+  defer(() => {
+    if (isActive()) action();
+  });
+}
+
 export default function autoCompact(pi: ExtensionAPI) {
   let config = { ...DEFAULT_CONFIG };
   
@@ -260,6 +290,12 @@ export default function autoCompact(pi: ExtensionAPI) {
   let pendingCompaction = false;
   let lastEstimatedTokens = 0;
   let truncationAppliedThisTurn = false;
+  // Set when a triggered compaction fails. ctx.compact() always aborts the running
+  // agent first, so a failed compaction otherwise strands the session with no nudge.
+  // While true, we stop re-triggering compaction (which would just abort the nudge's
+  // own turn and fail again) and rely on the `context` truncation guard instead.
+  let compactionBroken = false;
+  let active = true;
 
   // Phase-specific follow-up nudges, sent only when auto-compaction completes
   // and the agent is still idle. Manual `/compact` never reaches this path.
@@ -276,11 +312,17 @@ export default function autoCompact(pi: ExtensionAPI) {
     phase: AutoCompactPhase,
     customInstructions?: string,
   ): void => {
+    // A compact() call aborts the active run and needs a follow-up message. That
+    // continuation is meaningful only for an interactive session; print/JSON
+    // mode disposes its runtime as soon as the original prompt completes.
+    if (!active || ctx.mode !== "tui") return;
+
     pendingCompaction = true;
     ctx.compact({
       customInstructions,
       onComplete: () => {
         pendingCompaction = false;
+        compactionBroken = false;
         // ctx.compact() aborts the running agent, so we generally see
         // isIdle() === true here. But pi also flushes its own
         // `compactionQueuedMessages` (anything the user typed during
@@ -297,14 +339,24 @@ export default function autoCompact(pi: ExtensionAPI) {
         // honestly reflects whether anything else is about to drive a
         // turn. If something is, the new input acts as the follow-up and
         // we stay quiet; otherwise we kick the agent ourselves.
-        setImmediate(() => {
+        deferWhileActive(() => active, () => {
           if (ctx.isIdle()) {
             pi.sendUserMessage(AUTO_COMPACT_FOLLOW_UP[phase]);
           }
         });
       },
-      onError: () => {
+      onError: (error) => {
         pendingCompaction = false;
+        compactionBroken = true;
+        console.warn(`[auto-compact] Compaction failed: ${error.message}`);
+        // ctx.compact() already aborted the running agent even though it failed,
+        // so without a nudge here the session would sit idle forever. Same
+        // idle-check/defer as onComplete above.
+        deferWhileActive(() => active, () => {
+          if (ctx.isIdle()) {
+            pi.sendUserMessage(AUTO_COMPACT_FOLLOW_UP[phase]);
+          }
+        });
       },
     });
   };
@@ -350,14 +402,12 @@ export default function autoCompact(pi: ExtensionAPI) {
       updateCachedLimits(ctx);
     }
     
-    if (usage && usage.tokens !== null) {
-      return usage.tokens;
-    }
-    return lastEstimatedTokens;
+    return resolveTokenUsage(usage, lastEstimatedTokens);
   };
 
   pi.on("turn_start", async (event, ctx) => {
     truncationAppliedThisTurn = false;
+    if (compactionBroken) return;
     const tokens = getTokenUsage(ctx);
 
     if (tokens >= cachedAutoCompactLimit) {
@@ -381,13 +431,19 @@ export default function autoCompact(pi: ExtensionAPI) {
 
       if (newMessages) {
         truncationAppliedThisTurn = true;
-        setImmediate(() => {
-          triggerAutoCompact(
-            ctx,
-            "emergency",
-            "Emergency context truncation was applied. Generate a comprehensive summary.",
-          );
-        });
+        // Truncation alone already protects against overflow. Only ask pi's real
+        // compaction to also run (and abort the in-flight request) if it isn't
+        // currently broken — otherwise this would abort every oversized request
+        // to run a compaction we already know will fail.
+        if (!compactionBroken) {
+          deferWhileActive(() => active, () => {
+            triggerAutoCompact(
+              ctx,
+              "emergency",
+              "Emergency context truncation was applied. Generate a comprehensive summary.",
+            );
+          });
+        }
         return { messages: newMessages };
       }
     }
@@ -402,6 +458,7 @@ export default function autoCompact(pi: ExtensionAPI) {
       hasToolCalls = message.content.some((block: { type: string }) => block.type === "tool_use");
     }
     if (!hasToolCalls) return;
+    if (compactionBroken) return;
 
     const tokens = getTokenUsage(ctx);
     if (tokens >= cachedAutoCompactLimit && !pendingCompaction) {
@@ -413,8 +470,13 @@ export default function autoCompact(pi: ExtensionAPI) {
     }
   });
 
+  pi.on("session_shutdown", () => {
+    active = false;
+  });
+
   pi.on("session_start", async (event, ctx) => {
     pendingCompaction = false;
+    compactionBroken = false;
     truncationAppliedThisTurn = false;
     lastEstimatedTokens = 0;
 
@@ -574,7 +636,7 @@ export default function autoCompact(pi: ExtensionAPI) {
 
       if (trimmed === "status") {
         const usage = ctx.getContextUsage();
-        const tokens = usage?.tokens ?? lastEstimatedTokens;
+        const tokens = resolveTokenUsage(usage, lastEstimatedTokens);
         const percent = usage?.percent ?? (cachedAutoCompactLimit > 0 ? (tokens / cachedAutoCompactLimit * 100) : 0);
         ctx.ui.notify(
           `Auto-Compact Status:\n` +
@@ -583,6 +645,7 @@ export default function autoCompact(pi: ExtensionAPI) {
           `  Usage: ${percent.toFixed(1)}%\n` +
           `  Strategy: ${STRATEGY_LABELS[config.strategy]}\n` +
           `  Pending compaction: ${pendingCompaction}\n` +
+          `  Compaction broken: ${compactionBroken}\n` +
           `  Truncation this turn: ${truncationAppliedThisTurn}`,
           "info"
         );
@@ -604,4 +667,40 @@ export default function autoCompact(pi: ExtensionAPI) {
   pi.on("model_select", async (event) => {
     updateCachedLimits({ model: { contextWindow: event.model?.contextWindow ?? 200000 } });
   });
+}
+
+// ponytail: minimal regression check for the bug this file was fixed for
+// (stale lastEstimatedTokens masking pi's post-compaction "unknown" signal
+// and re-triggering compaction into "Nothing to compact (session too
+// small)"). Run with:
+//   node --experimental-strip-types extensions/auto-compact.ts --self-test
+if (process.argv.includes("--self-test")) {
+  assert.equal(
+    resolveTokenUsage({ tokens: null }, 185_303),
+    0,
+    "unknown post-compaction usage must not fall back to a stale estimate",
+  );
+  assert.equal(
+    resolveTokenUsage({ tokens: 42_000 }, 185_303),
+    42_000,
+    "known usage must be used as-is",
+  );
+  assert.equal(
+    resolveTokenUsage(undefined, 185_303),
+    185_303,
+    "no usage API (no model) must fall back to the last estimate",
+  );
+
+  let active = true;
+  let deferred: (() => void) | undefined;
+  let calls = 0;
+  deferWhileActive(
+    () => active,
+    () => { calls++; },
+    (callback) => { deferred = callback; },
+  );
+  active = false;
+  deferred?.();
+  assert.equal(calls, 0, "session shutdown must suppress deferred callbacks");
+  console.log("auto-compact self-test passed");
 }
