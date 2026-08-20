@@ -276,6 +276,14 @@ export default function autoCompact(pi: ExtensionAPI) {
     phase: AutoCompactPhase,
     customInstructions?: string,
   ): void => {
+    // Guard: if compaction is already in progress, don't start another.
+    // This prevents races from callers that don't check pendingCompaction.
+    if (pendingCompaction) return;
+    // Guard: if the last session entry is already a compaction, pi core will
+    // throw "Already compacted". Skip to avoid the error.
+    const entries = ctx.sessionManager.getEntries();
+    const lastEntry = entries[entries.length - 1];
+    if (lastEntry?.type === "compaction") return;
     pendingCompaction = true;
     ctx.compact({
       customInstructions,
@@ -382,11 +390,16 @@ export default function autoCompact(pi: ExtensionAPI) {
       if (newMessages) {
         truncationAppliedThisTurn = true;
         setImmediate(() => {
-          triggerAutoCompact(
-            ctx,
-            "emergency",
-            "Emergency context truncation was applied. Generate a comprehensive summary.",
-          );
+          // Re-check pendingCompaction: another event may have triggered compaction
+          // while this callback was deferred. Without this check, we race and get
+          // "Already compacted" from pi core.
+          if (!pendingCompaction) {
+            triggerAutoCompact(
+              ctx,
+              "emergency",
+              "Emergency context truncation was applied. Generate a comprehensive summary.",
+            );
+          }
         });
         return { messages: newMessages };
       }
